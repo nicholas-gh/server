@@ -24,11 +24,23 @@ DEFAULT_SENDSPIN_CODEC = "flac"
 
 CONF_ENTRY_OUTPUT_CODEC_CAST = create_output_codec_config_entry(default_value="flac")
 CONF_ENTRY_OUTPUT_CODEC_CAST.options = [
-    ConfigValueOption("WAV (lossless, uncompressed, supports range requests)", "wav")
+    ConfigValueOption("FLAC (lossless, compressed, supports range requests)", "flac")
+    if opt.value == "flac"
+    else ConfigValueOption("MP3 (lossy, supports range requests)", "mp3")
+    if opt.value == "mp3"
+    else ConfigValueOption("AAC (lossy, supports range requests)", "aac")
+    if opt.value == "aac"
+    else ConfigValueOption("WAV (lossless, uncompressed, supports range requests)", "wav")
     if opt.value == "wav"
     else opt
     for opt in (CONF_ENTRY_OUTPUT_CODEC_CAST.options or [])
 ]
+if CONF_ENTRY_OUTPUT_CODEC_CAST.description:
+    CONF_ENTRY_OUTPUT_CODEC_CAST.description += (
+        "\n\nChromecast note: Some Cast Lite devices buffer ahead, close the HTTP connection, "
+        "and later reconnect using HTTP Range requests. Music Assistant supports this resume "
+        "behavior for FLAC, MP3, AAC and WAV output."
+    )
 
 CAST_PLAYER_CONFIG_ENTRIES = (
     CONF_ENTRY_OUTPUT_CODEC_CAST,

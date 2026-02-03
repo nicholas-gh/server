@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import logging
 import os
+import tempfile
+import time
 import urllib.parse
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, cast
 
+import aiofiles
 from aiofiles.os import wrap
 from aiohttp import web
 from music_assistant_models.config_entries import (
@@ -116,6 +120,15 @@ CONF_ALLOW_BUFFER: Final[str] = "allow_buffering"
 CONF_ALLOW_CROSSFADE_SAME_ALBUM: Final[str] = "allow_crossfade_same_album"
 CONF_SMART_FADES_LOG_LEVEL: Final[str] = "smart_fades_log_level"
 
+# Chromecast Cast Lite: allow short disconnects while we keep encoding.
+ENCODED_RANGE_CACHE_IDLE_TIMEOUT: Final[float] = 10 * 60  # seconds
+ENCODED_RANGE_CACHE_KEEP_FINISHED: Final[float] = 10 * 60  # seconds
+ENCODED_RANGE_CACHE_READ_CHUNK_SIZE: Final[int] = 128 * 1024
+ENCODED_RANGE_CACHE_MIN_SERVE_SIZE: Final[int] = 512 * 1024
+ENCODED_RANGE_CACHE_MAX_SERVE_SIZE: Final[int] = 5 * 1024 * 1024
+# Keep this low: we don't want Cast Lite to time out waiting for a resume response.
+ENCODED_RANGE_CACHE_WAIT_FOR_FINISH_TIMEOUT: Final[float] = 1.0  # seconds
+
 # Calculate total system memory once at module load time
 TOTAL_SYSTEM_MEMORY_GB: Final[float] = get_total_system_memory()
 CONF_ALLOW_BUFFER_DEFAULT = TOTAL_SYSTEM_MEMORY_GB >= 8.0
@@ -147,6 +160,67 @@ class CrossfadeData:
     queue_item_id: str
 
 
+@dataclass
+class EncodedRangeCache:
+    """Progressive encode cache for Chromecast Range requests (compressed codecs)."""
+
+    cache_key: str
+    path: str
+    bytes_written: int = 0
+    finished: bool = False
+    error: Exception | None = None
+    created_at: float = field(default_factory=time.monotonic)
+    last_access: float = field(default_factory=time.monotonic)
+    active_clients: int = 0
+    encode_task: asyncio.Task[None] | None = None
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+    async def notify(self) -> None:
+        """Notify all waiters that state changed."""
+        async with self.cond:
+            self.cond.notify_all()
+
+    async def wait_for_bytes(self, size: int, *, timeout: float | None = None) -> None:
+        """Wait until at least `size` bytes are available (or cache finishes/errors)."""
+        if size <= 0:
+            return
+        async with self.cond:
+            if self.error is not None or self.finished or self.bytes_written >= size:
+                return
+            if timeout is None:
+                while self.bytes_written < size and not self.finished and self.error is None:
+                    await self.cond.wait()
+            else:
+                end_time = time.monotonic() + timeout
+                while self.bytes_written < size and not self.finished and self.error is None:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    try:
+                        await asyncio.wait_for(self.cond.wait(), timeout=remaining)
+                    except TimeoutError:
+                        return
+
+    async def wait_for_finished(self, *, timeout: float | None = None) -> None:
+        """Wait until the cache is finished (or errors)."""
+        async with self.cond:
+            if self.finished or self.error is not None:
+                return
+            if timeout is None:
+                while not self.finished and self.error is None:
+                    await self.cond.wait()
+            else:
+                end_time = time.monotonic() + timeout
+                while not self.finished and self.error is None:
+                    remaining = end_time - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    try:
+                        await asyncio.wait_for(self.cond.wait(), timeout=remaining)
+                    except TimeoutError:
+                        return
+
+
 class StreamsController(CoreController):
     """Webserver Controller to stream audio to players."""
 
@@ -166,6 +240,8 @@ class StreamsController(CoreController):
         self.manifest.icon = "cast-audio"
         self.announcements: dict[str, AnnounceData] = {}
         self._crossfade_data: dict[str, CrossfadeData] = {}
+        self._encoded_range_caches: dict[str, EncodedRangeCache] = {}
+        self._encoded_range_caches_lock = asyncio.Lock()
         self._bind_ip: str = "0.0.0.0"
         self._smart_fades_mixer = SmartFadesMixer(self)
         self._smart_fades_analyzer = SmartFadesAnalyzer(self)
@@ -380,6 +456,12 @@ class StreamsController(CoreController):
 
     async def close(self) -> None:
         """Cleanup on exit."""
+        # Stop any background encoders and remove temp cache files.
+        for cache in list(self._encoded_range_caches.values()):
+            if cache.encode_task and not cache.encode_task.done():
+                cache.encode_task.cancel()
+        self._prune_encoded_range_caches(force=True)
+        self._encoded_range_caches.clear()
         await self._server.close()
 
     async def resolve_stream_url(
@@ -464,6 +546,35 @@ class StreamsController(CoreController):
         )
 
         range_header = request.headers.get("Range")
+        user_agent = request.headers.get("User-Agent", "")
+        if (
+            queue_player.provider.domain == "chromecast"
+            and output_format.content_type
+            in (ContentType.FLAC, ContentType.MP3, ContentType.AAC)
+            and (queue_item.streamdetails.duration or queue_item.duration)
+            and ("Cast Lite" in user_agent or range_header)
+        ):
+            # Some Chromecast "Cast Lite" devices intentionally close the HTTP connection after
+            # buffering and later reconnect using Range requests. For compressed codecs, we can't
+            # translate byte offsets to time offsets reliably, so we keep a progressive encode
+            # cache and serve byte ranges directly from the encoded output.
+            self.logger.debug(
+                "Using encoded-range cache stream for %s: fmt=%s ua=%s range=%s",
+                queue.display_name,
+                output_format.content_type.value,
+                user_agent,
+                range_header,
+            )
+            return await self._serve_encoded_queue_item_stream_with_range_cache(
+                request=request,
+                queue=queue,
+                queue_item=queue_item,
+                queue_player=queue_player,
+                input_pcm_format=pcm_format,
+                output_format=output_format,
+                range_header=range_header,
+                user_agent=user_agent,
+            )
         if (
             queue_player.provider.domain == "chromecast"
             and output_format.content_type == ContentType.WAV
@@ -602,22 +713,39 @@ class StreamsController(CoreController):
                         queue_player.provider.domain == "chromecast"
                         and "Cast Lite" in user_agent
                     )
-                    if is_cast_lite and output_format.content_type != ContentType.WAV:
-                        # Cast Lite devices are known to buffer aggressively and then close the HTTP
-                        # connection. They may later reconnect using HTTP Range requests to continue
-                        # downloading. Range support is currently only available for WAV streams.
-                        self.logger.warning(
-                            "Player %s closed %s stream early for %s (%s) - Cast Lite may resume "
-                            "with HTTP Range requests; enable WAV output codec to support this. "
-                            "error: %s, sent %d bytes, expected (approx) bytes=%d",
-                            queue.display_name,
-                            output_format.output_format_str,
-                            queue_item.name,
-                            queue_item.uri,
-                            err.__class__.__name__,
-                            bytes_sent,
-                            bytes_expected,
-                        )
+                    if is_cast_lite:
+                        if output_format.content_type not in (
+                            ContentType.WAV,
+                            ContentType.FLAC,
+                            ContentType.MP3,
+                            ContentType.AAC,
+                        ):
+                            # Cast Lite devices are known to buffer aggressively and then close the HTTP
+                            # connection. They may later reconnect using HTTP Range requests to continue
+                            # downloading. Range support is currently available for FLAC, MP3, AAC and WAV streams.
+                            self.logger.warning(
+                                "Player %s closed %s stream early for %s (%s) - Cast Lite may resume "
+                                "with HTTP Range requests; use FLAC (default), WAV, MP3 or AAC output codec to support this. "
+                                "error: %s, sent %d bytes, expected (approx) bytes=%d",
+                                queue.display_name,
+                                output_format.output_format_str,
+                                queue_item.name,
+                                queue_item.uri,
+                                err.__class__.__name__,
+                                bytes_sent,
+                                bytes_expected,
+                            )
+                        else:
+                            self.logger.debug(
+                                "Player %s closed stream after buffering (Cast Lite expected behavior) "
+                                "for %s (%s) - error: %s, sent %d bytes, expected (approx) bytes=%d",
+                                queue.display_name,
+                                queue_item.name,
+                                queue_item.uri,
+                                err.__class__.__name__,
+                                bytes_sent,
+                                bytes_expected,
+                            )
                     else:
                         self.logger.warning(
                             "Player %s disconnected prematurely from stream for %s (%s) - "
@@ -686,6 +814,412 @@ class StreamsController(CoreController):
         else:
             end = total_size - 1
         return (start, end)
+
+    @staticmethod
+    def _parse_http_range_start_end(range_header: str) -> tuple[int, int | None] | None:
+        """Parse a single HTTP Range header (bytes=START-END) without requiring total size."""
+        if not range_header:
+            return None
+        if not range_header.startswith("bytes="):
+            return None
+        range_spec = range_header[6:].strip()
+        # only support a single range
+        if "," in range_spec:
+            return None
+        if range_spec.startswith("-"):
+            # suffix-length range (bytes=-N) requires total size
+            return None
+        if "-" not in range_spec:
+            return None
+        start_str, end_str = range_spec.split("-", 1)
+        if not start_str:
+            return None
+        try:
+            start = int(start_str)
+        except ValueError:
+            return None
+        if start < 0:
+            return None
+        end: int | None = None
+        if end_str:
+            try:
+                end = int(end_str)
+            except ValueError:
+                return None
+            if end < start:
+                return None
+        return (start, end)
+
+    def _get_encoded_range_cache_key(
+        self,
+        *,
+        queue: PlayerQueue,
+        queue_item: QueueItem,
+        queue_player: Player,
+        input_pcm_format: AudioFormat,
+        output_format: AudioFormat,
+        filter_params: list[str],
+    ) -> str:
+        """Create a stable cache key for an encoded queue item stream."""
+        streamdetails = queue_item.streamdetails
+        assert streamdetails
+        base_seek = int(streamdetails.seek_position or 0)
+        key_parts = (
+            "encoded_range_v1",
+            str(queue.session_id),
+            str(queue.queue_id),
+            str(queue_item.queue_item_id),
+            str(queue_item.uri),
+            f"seek={base_seek}",
+            f"player={queue_player.player_id}",
+            f"in={input_pcm_format.sample_rate}/{input_pcm_format.bit_depth}/{input_pcm_format.channels}/{input_pcm_format.content_type.value}",  # noqa: E501
+            f"out={output_format.sample_rate}/{output_format.bit_depth}/{output_format.channels}/{output_format.content_type.value}",  # noqa: E501
+            "filters=" + ",".join(filter_params),
+        )
+        key_raw = "|".join(key_parts).encode()
+        return hashlib.sha1(key_raw).hexdigest()  # noqa: S324
+
+    async def _get_or_create_encoded_range_cache(
+        self, cache_key: str, *, suffix: str
+    ) -> EncodedRangeCache:
+        """Get or create an encoded range cache entry."""
+        if (cache := self._encoded_range_caches.get(cache_key)) is not None:
+            cache.last_access = time.monotonic()
+            return cache
+        async with self._encoded_range_caches_lock:
+            if (cache := self._encoded_range_caches.get(cache_key)) is not None:
+                cache.last_access = time.monotonic()
+                return cache
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="ma-encoded-range-",
+                suffix=suffix,
+                delete=False,
+            )
+            tmp.close()
+            cache = EncodedRangeCache(cache_key=cache_key, path=tmp.name)
+            self._encoded_range_caches[cache_key] = cache
+            return cache
+
+    async def _encode_queue_item_to_encoded_cache(
+        self,
+        *,
+        cache: EncodedRangeCache,
+        queue: PlayerQueue,
+        queue_item: QueueItem,
+        queue_player: Player,
+        input_pcm_format: AudioFormat,
+        output_format: AudioFormat,
+        filter_params: list[str],
+    ) -> None:
+        """Background task: encode a queue item and append to cache file."""
+        streamdetails = queue_item.streamdetails
+        assert streamdetails
+        base_seek = int(streamdetails.seek_position or 0)
+        cache_logger = self.logger.getChild("encoded_range_cache")
+        cache_logger.debug(
+            "Start encoded cache encode for %s (%s) seek=%s key=%s fmt=%s",
+            queue.display_name,
+            queue_item.uri,
+            base_seek,
+            cache.cache_key,
+            output_format.content_type.value,
+        )
+        try:
+            async with aiofiles.open(cache.path, mode="wb", buffering=0) as out_fh:
+                audio_input = self.get_queue_item_stream(
+                    queue_item=queue_item,
+                    pcm_format=input_pcm_format,
+                    seek_position=base_seek,
+                )
+                async for chunk in get_ffmpeg_stream(
+                    audio_input=audio_input,
+                    input_format=input_pcm_format,
+                    output_format=output_format,
+                    filter_params=filter_params,
+                ):
+                    if not chunk:
+                        continue
+                    await out_fh.write(chunk)
+                    cache.bytes_written += len(chunk)
+                    await cache.notify()
+                # If the underlying stream aborted with an AudioError, get_queue_item_stream sets
+                # stream_error but does not necessarily raise. Treat that as an error for caching.
+                if streamdetails.stream_error:
+                    raise AudioError("Source stream aborted")  # noqa: TRY003
+        except asyncio.CancelledError:
+            cache_logger.debug("Cancelled encoded cache encode key=%s", cache.cache_key)
+            raise
+        except Exception as err:
+            cache.error = err
+            cache_logger.warning(
+                "Encoded cache encode error key=%s item=%s: %s",
+                cache.cache_key,
+                queue_item.uri,
+                err,
+            )
+        finally:
+            cache.finished = True
+            await cache.notify()
+            cache_logger.debug(
+                "Finished encoded cache encode key=%s fmt=%s bytes_written=%d error=%s",
+                cache.cache_key,
+                output_format.content_type.value,
+                cache.bytes_written,
+                cache.error.__class__.__name__ if cache.error else None,
+            )
+
+    async def _serve_encoded_queue_item_stream_with_range_cache(
+        self,
+        *,
+        request: web.Request,
+        queue: PlayerQueue,
+        queue_item: QueueItem,
+        queue_player: Player,
+        input_pcm_format: AudioFormat,
+        output_format: AudioFormat,
+        range_header: str | None,
+        user_agent: str,
+    ) -> web.StreamResponse:
+        """Serve an encoded stream for a single queue item, with byte-range resume via cache."""
+        streamdetails = queue_item.streamdetails
+        assert streamdetails
+
+        # We intentionally do NOT apply smartfades/crossfade here: the output must be a stable,
+        # deterministic byte stream across reconnects for Range resume to work.
+        filter_params = get_player_filter_params(
+            self.mass,
+            player_id=queue_player.player_id,
+            input_format=input_pcm_format,
+            output_format=output_format,
+        )
+        cache_key = self._get_encoded_range_cache_key(
+            queue=queue,
+            queue_item=queue_item,
+            queue_player=queue_player,
+            input_pcm_format=input_pcm_format,
+            output_format=output_format,
+            filter_params=filter_params,
+        )
+        suffix = f".{output_format.content_type.value}"
+        cache = await self._get_or_create_encoded_range_cache(cache_key, suffix=suffix)
+        cache.last_access = time.monotonic()
+
+        # Ensure background encoder task is running (exactly once per cache key).
+        if cache.encode_task is None:
+            cache.encode_task = self.mass.create_task(
+                self._encode_queue_item_to_encoded_cache,
+                cache=cache,
+                queue=queue,
+                queue_item=queue_item,
+                queue_player=queue_player,
+                input_pcm_format=input_pcm_format,
+                output_format=output_format,
+                filter_params=filter_params,
+                task_id=f"encoded_range_encode_{cache.cache_key}",
+            )
+
+        req_range_header = range_header
+        start = 0
+        end: int | None = None
+        status = 200
+        request_started_at = time.monotonic()
+        if req_range_header:
+            parsed2 = self._parse_http_range_start_end(req_range_header)
+            if parsed2 is None:
+                resp = web.StreamResponse(status=416, reason="Requested Range Not Satisfiable")
+                resp.headers["Content-Range"] = "bytes */*"
+                resp.headers["Accept-Ranges"] = "bytes"
+                await resp.prepare(request)
+                return resp
+            start, end = parsed2
+            if start == 0 and end is None:
+                # Many clients send "Range: bytes=0-" for the initial request.
+                # It's valid for us to ignore it and respond with a normal 200 stream.
+                status = 200
+            else:
+                status = 206
+
+        # If the client asks for a byte we haven't encoded yet, wait until it's available
+        # (or until the encode finishes/errors).
+        await cache.wait_for_bytes(start + 1)
+        if cache.error is not None:
+            raise web.HTTPInternalServerError(reason=str(cache.error))
+        if cache.finished and start >= cache.bytes_written:
+            resp = web.StreamResponse(status=416, reason="Requested Range Not Satisfiable")
+            resp.headers["Content-Range"] = f"bytes */{cache.bytes_written}"
+            resp.headers["Accept-Ranges"] = "bytes"
+            await resp.prepare(request)
+            return resp
+
+        content_range_header: str | None = None
+        content_length: int | None = None
+        if status == 206:
+            # Some clients (notably Chromecast Cast Lite) request open-ended ranges (bytes=N-).
+            # Strictly speaking, a request for "bytes=N-" means "to end of file", which requires a
+            # known total size. Our encoder usually completes quickly, so for open-ended ranges we
+            # wait briefly for the encode to finish. If it still isn't finished, we fall back to a
+            # bounded window with an unknown total ("*") for best-effort compatibility.
+            waited_for_finish = 0.0
+            if end is None and not cache.finished:
+                wait_started_at = time.monotonic()
+                await cache.wait_for_finished(timeout=ENCODED_RANGE_CACHE_WAIT_FOR_FINISH_TIMEOUT)
+                waited_for_finish = time.monotonic() - wait_started_at
+                if cache.error is not None:
+                    raise web.HTTPInternalServerError(reason=str(cache.error))
+
+            if end is None:
+                if cache.finished:
+                    end = cache.bytes_written - 1
+                else:
+                    # Wait until we have a reasonable chunk available (or encoding finishes).
+                    await cache.wait_for_bytes(
+                        start + ENCODED_RANGE_CACHE_MIN_SERVE_SIZE, timeout=2.0
+                    )
+                    if cache.error is not None:
+                        raise web.HTTPInternalServerError(reason=str(cache.error))
+                    available = cache.bytes_written
+                    if cache.finished and start >= available:
+                        resp = web.StreamResponse(
+                            status=416, reason="Requested Range Not Satisfiable"
+                        )
+                        resp.headers["Content-Range"] = f"bytes */{available}"
+                        resp.headers["Accept-Ranges"] = "bytes"
+                        await resp.prepare(request)
+                        return resp
+                    end = min(start + ENCODED_RANGE_CACHE_MAX_SERVE_SIZE - 1, available - 1)
+            else:
+                # Ensure we have all requested bytes available.
+                await cache.wait_for_bytes(end + 1)
+                if cache.error is not None:
+                    raise web.HTTPInternalServerError(reason=str(cache.error))
+                if cache.finished and end >= cache.bytes_written:
+                    resp = web.StreamResponse(
+                        status=416, reason="Requested Range Not Satisfiable"
+                    )
+                    resp.headers["Content-Range"] = f"bytes */{cache.bytes_written}"
+                    resp.headers["Accept-Ranges"] = "bytes"
+                    await resp.prepare(request)
+                    return resp
+
+            total_str = str(cache.bytes_written) if cache.finished else "*"
+            content_range_header = f"bytes {start}-{end}/{total_str}"
+            content_length = (end - start) + 1
+            if waited_for_finish:
+                self.logger.debug(
+                    "Encoded cache waited %.2fs for encode finish (fmt=%s start=%d end=%s finished=%s bytes_written=%d)",  # noqa: E501
+                    waited_for_finish,
+                    output_format.content_type.value,
+                    start,
+                    end,
+                    cache.finished,
+                    cache.bytes_written,
+                )
+
+        content_type_header = (
+            "audio/mpeg"
+            if output_format.content_type == ContentType.MP3
+            else f"audio/{output_format.content_type.value}"
+        )
+        self.logger.debug(
+            "Encoded cache request for %s: fmt=%s ua=%s req_range=%s -> status=%d resp_range=%s resp_len=%s cache_written=%d finished=%s",  # noqa: E501
+            queue.display_name,
+            output_format.content_type.value,
+            user_agent,
+            req_range_header,
+            status,
+            content_range_header,
+            content_length,
+            cache.bytes_written,
+            cache.finished,
+        )
+        headers = {
+            **DEFAULT_STREAM_HEADERS,
+            "icy-name": queue_item.name,
+            "contentFeatures.dlna.org": "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01500000000000000000000000000000",  # noqa: E501
+            "Accept-Ranges": "bytes",
+            "Content-Type": content_type_header,
+        }
+        if content_range_header is not None:
+            headers["Content-Range"] = content_range_header
+
+        reason = "Partial Content" if status == 206 else "OK"
+        resp = web.StreamResponse(status=status, reason=reason, headers=headers)
+        resp.content_type = content_type_header
+        if content_length is not None:
+            resp.content_length = content_length
+        else:
+            resp.enable_chunked_encoding()
+        await resp.prepare(request)
+
+        if request.method != "GET":
+            return resp
+
+        cache.active_clients += 1
+        bytes_sent = 0
+        first_bytes_written = False
+        client_disconnected = False
+        try:
+            async with aiofiles.open(cache.path, mode="rb") as in_fh:
+                await in_fh.seek(start)
+                pos = start
+                bytes_remaining = (end - start) + 1 if end is not None else None
+                while True:
+                    cache.last_access = time.monotonic()
+                    available = cache.bytes_written
+                    if bytes_remaining is not None and bytes_remaining <= 0:
+                        break
+                    if pos >= available:
+                        if cache.error is not None:
+                            break
+                        if cache.finished:
+                            break
+                        await cache.wait_for_bytes(pos + 1)
+                        continue
+                    # only read up to what has been encoded so far (and the requested end, if any)
+                    to_read = min(ENCODED_RANGE_CACHE_READ_CHUNK_SIZE, available - pos)
+                    if bytes_remaining is not None:
+                        to_read = min(to_read, bytes_remaining)
+                    if to_read <= 0:
+                        await asyncio.sleep(0)
+                        continue
+                    data = await in_fh.read(to_read)
+                    if not data:
+                        # writer might not have flushed yet, wait for more bytes
+                        await cache.wait_for_bytes(pos + 1)
+                        continue
+                    try:
+                        await resp.write(data)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionError):
+                        client_disconnected = True
+                        break
+                    if not first_bytes_written:
+                        first_bytes_written = True
+                        self.mass.player_queues.track_loaded_in_buffer(
+                            queue_item.queue_id, queue_item.queue_item_id
+                        )
+                    bytes_sent += len(data)
+                    pos += len(data)
+                    if bytes_remaining is not None:
+                        bytes_remaining -= len(data)
+        finally:
+            cache.active_clients = max(0, cache.active_clients - 1)
+
+        if queue_player.provider.domain == "chromecast":
+            self.logger.debug(
+                "Encoded cache served to %s: fmt=%s ua=%s status=%d req_range=%s resp_range=%s resp_len=%s bytes_sent=%d finished=%s disconnected=%s in %.2fs",  # noqa: E501
+                queue.display_name,
+                output_format.content_type.value,
+                user_agent,
+                status,
+                req_range_header,
+                resp.headers.get("Content-Range"),
+                resp.content_length,
+                bytes_sent,
+                cache.finished,
+                client_disconnected,
+                time.monotonic() - request_started_at,
+            )
+        return resp
 
     async def _serve_wav_queue_item_stream_with_range(
         self,
@@ -2139,12 +2673,24 @@ class StreamsController(CoreController):
                 request.headers,
             )
         else:
-            self.logger.debug(
-                "Got %s request to %s from %s",
-                request.method,
-                request.path,
-                request.remote,
-            )
+            user_agent = request.headers.get("User-Agent", "")
+            range_header = request.headers.get("Range")
+            if range_header or "Cast" in user_agent:
+                self.logger.debug(
+                    "Got %s request to %s from %s ua=%s range=%s",
+                    request.method,
+                    request.path,
+                    request.remote,
+                    user_agent,
+                    range_header,
+                )
+            else:
+                self.logger.debug(
+                    "Got %s request to %s from %s",
+                    request.method,
+                    request.path,
+                    request.remote,
+                )
 
     async def get_output_format(
         self,
@@ -2319,6 +2865,7 @@ class StreamsController(CoreController):
             VERBOSE_LOG_LEVEL,
             "Running periodic garbage collection...",
         )
+        self._prune_encoded_range_caches()
         # Run garbage collection in executor to avoid blocking the event loop
         # Since this runs periodically (not in response to subprocess cleanup),
         # it's safe to run in a thread without causing thread-safety issues
@@ -2331,6 +2878,40 @@ class StreamsController(CoreController):
         )
         # Schedule next run in 15 minutes
         self.mass.call_later(900, self._periodic_garbage_collection)
+
+    def _prune_encoded_range_caches(self, *, force: bool = False) -> None:
+        """Cleanup stale encoded range cache entries and temp files."""
+        if not self._encoded_range_caches:
+            return
+        now = time.monotonic()
+        for cache_key, cache in list(self._encoded_range_caches.items()):
+            if not force and cache.active_clients:
+                continue
+            if force:
+                try:
+                    os.remove(cache.path)
+                except (FileNotFoundError, OSError):
+                    pass
+                self._encoded_range_caches.pop(cache_key, None)
+                continue
+            idle = now - cache.last_access
+            # If nobody is connected for a while, stop encoding to avoid wasting resources.
+            if (
+                cache.encode_task
+                and not cache.encode_task.done()
+                and (force or idle > ENCODED_RANGE_CACHE_IDLE_TIMEOUT)
+            ):
+                cache.encode_task.cancel()
+            # Remove finished caches after a short grace period (or immediately on shutdown).
+            if cache.finished and (force or idle > ENCODED_RANGE_CACHE_KEEP_FINISHED):
+                try:
+                    os.remove(cache.path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    # Best-effort cleanup; file may still be in use.
+                    continue
+                self._encoded_range_caches.pop(cache_key, None)
 
     def _setup_smart_fades_logger(self, config: CoreConfig) -> None:
         """Set up smart fades logger level."""

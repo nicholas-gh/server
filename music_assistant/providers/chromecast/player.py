@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -562,7 +563,7 @@ class ChromecastPlayer(Player):
                                     "uri": cmd_next_url,
                                     "queue_item_id": cmd_next_url,
                                 },
-                                "contentType": "audio/flac",
+                                "contentType": "audio/mpeg",
                                 "streamType": STREAM_TYPE_LIVE,
                                 "metadata": {},
                             },
@@ -668,6 +669,19 @@ class ChromecastPlayer(Player):
             if not isinstance(group_player, ChromecastPlayer):
                 return
             status = group_player.cc.media_controller.status
+
+        # Debug-only: log IDLE/idle-reason transitions to help diagnose Cast Lite stream/range issues.
+        idle_reason = getattr(status, "idle_reason", None)
+        if self.logger.isEnabledFor(logging.DEBUG) and (status.player_is_idle or idle_reason):
+            self.logger.debug(
+                "[%s] Cast media status: state=%s idle_reason=%s t=%s/%s content_id=%s",
+                self.cast_info.friendly_name,
+                status.player_state,
+                idle_reason,
+                status.current_time,
+                status.duration,
+                status.content_id,
+            )
 
         # player state
         self._attr_elapsed_time_last_updated = time.time()
@@ -787,7 +801,16 @@ class ChromecastPlayer(Player):
         """Create CC media item from MA PlayerMedia."""
         uri = media.uri or ""
         clean_uri = uri.split("?", 1)[0].split("#", 1)[0].lower()
-        content_type = "audio/wav" if clean_uri.endswith(".wav") else "audio/flac"
+        if clean_uri.endswith(".wav"):
+            content_type = "audio/wav"
+        elif clean_uri.endswith(".mp3"):
+            content_type = "audio/mpeg"
+        elif clean_uri.endswith(".aac"):
+            content_type = "audio/aac"
+        elif clean_uri.endswith(".flac"):
+            content_type = "audio/flac"
+        else:
+            content_type = "audio/flac"
 
         if media.media_type == MediaType.TRACK:
             stream_type = STREAM_TYPE_BUFFERED
